@@ -1,11 +1,14 @@
 {
   "name": "pi-agent-channel",
-  "version": "1.0.0",
-  "description": "Mailbox channel via filesystem for coordinating two pi agents (separate sessions) on a shared working tree. Blocking semaphore + readable local log. Ships a custom tool (agent_channel), a prompt, and the underlying node script.",
-  "keywords": ["pi-package"],
+  "version": "1.3.0",
+  "description": "Mailbox channel via filesystem for coordinating two pi agents (separate sessions) on a shared working tree. AXI-compliant CLI (TOON output, content-first, structured errors). Ships a custom tool (agent_channel), a prompt, and the underlying node script.",
+  "keywords": ["pi-package", "axi"],
   "license": "MIT",
   "bin": {
     "agent-channel": "./bin/agent-channel.js"
+  },
+  "scripts": {
+    "test": "node test/toon.test.js"
   },
   "pi": {
     "extensions": ["./extensions"],

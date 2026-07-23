@@ -39,8 +39,10 @@ agent_channel({
 ```
 
 `action`: `send` | `wait` | `send-wait` | `show`. Stessa semantica dei comandi
-script (§B). Il ritorno del tool contiene stdout (msg pretty + reminder su
-timeout) e `details.exitCode` (0 ok, 2 timeout).
+script (§B). Il ritorno del tool contiene `content[].text` (output strutturato
+**TOON**: tabelle `messages[N]{ts,sender,msg}`, oggetti `sent` / `timeout` /
+`error`) e `details` con `exitCode` (0 = ok, 2 = timeout o usage error,
+1 = errore interno) e `status` (`ok` / `timeout` / `usage_error` / `error`).
 
 ### B) Via script da bash (fallback / uso umano diretto)
 
@@ -54,18 +56,69 @@ puro). Stati del canale in `<cwd>/.agents/<channel>/` (overridabile con
 | `send <channel> <who> <msg...>` | Scrive il messaggio e **ritorna subito** (= *rispondo e continuo per i fatti miei*) | 0 |
 | `wait <channel> <who> [--timeout=N]` | **Blocca** finché arriva un messaggio da un altro `sender`; lo stampa (pretty), avanza il cursore | 0 = ricevuto, 2 = timeout |
 | `send-wait <channel> <who> <msg...> [--timeout=N]` | **send + wait** in uno (= *rispondo e mi metto in attesa*: la "function call" combinata) | 0 / 2 |
-| `show <channel>` | Pretty-print dell'intero transcript (log leggibile) | 0 |
+| `show <channel> [--limit=N] [--full] [--fields=ts,sender,msg]` | Transcript in TOON: `total`, `by_sender[N]{sender,count,last_ts}`, tabella `messages`; `msg` troncato a 500 char (preview) a meno di `--full` | 0 |
 
 - **Timeout di default = 210s (3.5 min)**, sotto il cap tipico del tool bash.
 - Allo **scadere del timeout** lo script stampa un **Reminder Prompt** che ti dice
   di rimetterti in attesa (nomina anche l'altro partecipante se lo conosce).
 - Se ci sono già messaggi non letti → `wait` ritorna subito.
-- Più messaggi accumulati → tornano tutti insieme.
-- Output pretty: `[HH:MM:SS] SENDER: msg`.
+- Più messaggi accumulati → tornano tutti insieme in una tabella TOON `messages[N]{ts,sender,msg}`.
+- Output strutturato in **TOON** (Token-Oriented Object Notation): leggibile e
+  ~40% più token-efficient del JSON equivalente. `show` aggiunge `total`,
+  `shown` e `by_sender[N]{sender,count,last_ts}`.
+- Lanciare `agent-channel` senza argomenti restituisce la **home**: stato live
+  dei canali (`channels[N]{name,total,last_sender,last_ts}`), niente manuale.
+- **Root condivisa** per agenti in cwd diverse: `--root=<path>` (flag globale,
+  ogni subcommand e la home) o env `AGENT_CHANNEL_ROOT=<path>`. Il transcript va
+  in `<root>/.agents/<channel>/`. Vedi §C.
+
+### C) Quando i due agenti sono in directory diverse (cwd diverse)
+
+Se tu e l'altro agente lavorate in working tree **diversi** (es. tu in
+`<root>/fancy-copy-paste/`, lui in `<root>/noderfy-admin/`), ognuno con la
+propria cwd non vede il transcript dell'altro. Soluzione: concordate una
+**root condivisa** (il genitore comune dei vostri repo) e puntate entrambi lì.
+
+- **Via tool `agent_channel`** (RACCOMANDATO): passate lo stesso parametro
+  `root` in entrambe le sessioni:
+  ```
+  agent_channel({ action: "send-wait", channel: "fcp-log-render",
+                  who: "FCP", msg: "root cause = X. Tu?",
+                  root: "/c/github/noderfy", timeout: 210 })
+  ```
+- **Via script**: flag `--root=<path>` o env `AGENT_CHANNEL_ROOT=<path>`:
+  ```
+  AGENT_CHANNEL_ROOT=/c/github/noderfy node .../agent-channel.js send-wait fcp-log-render FCP "..."
+  node .../agent-channel.js show fcp-log-render --root=/c/github/noderfy
+  ```
+
+Il transcript va in `<root>/.agents/<channel>/`, condiviso. La **home** con
+`--root=<path>` (o l'azione `show` con `root`) mostra i canali presenti in
+quella root, anche se la tua cwd è un'altra.
 
 Esempio di "turno" completo (risposta + attesa):
 ```
 node ~/.pi/agent/bin/agent-channel.js send-wait <channel> ZED "root cause = X. Procedo su file A. Tu?" --timeout=210
+```
+
+Esempio di output TOON (wait che riceve 2 messaggi, exit 0):
+```
+channel: diag
+received: 2
+messages[2]{ts,sender,msg}:
+  1784344404,VANTA,Concordo. Verifico il listener main.tsx.
+  1784344409,VANTA,Root cause confermata: token JWT stantio
+help[1]: Run `agent-channel send-wait diag ZED "<reply>"` to answer and wait again
+```
+
+Esempio di output TOON (timeout, exit 2):
+```
+timeout:
+  seconds: 210
+  last_other_sender: VANTA
+reminder: "Nessun messaggio da VANTA negli ultimi 210s. Se VANTA è ancora al lavoro, RIMETTITI IN ATTESA rieseguendo 'wait' (o 'send-wait'). Solo se lo ritieni assente: sollecita con 'send' o prosegui."
+exit: 2
+help[2]: Run `agent-channel wait diag ZED --timeout=210` to keep waiting, Run `agent-channel send diag ZED "<nudge>"` to nudge VANTA
 ```
 
 ## 2. Setup + scelta del nome

@@ -11,6 +11,7 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const BIN = join(__dirname, "..", "bin", "agent-channel.js");
@@ -40,11 +41,13 @@ export default function (pi) {
     name: "agent_channel",
     label: "Agent Channel",
     description:
-      "Mailbox channel via filesystem to coordinate with another pi agent in a separate session, on a shared working tree. Blocking semaphore: 'wait' and 'send-wait' block the caller until the other agent writes a new message (or until the timeout). Leaves a readable local log at <cwd>/.agents/<channel>/. Use it when the user puts you in communication with another agent via a file channel. Actions: 'send' (write + return immediately), 'wait' (block until other writes), 'send-wait' (write + block), 'show' (print whole transcript). Exit 0 = message received, 2 = timeout (a reminder is printed suggesting to wait again).",
+      "Mailbox channel via filesystem to coordinate with another pi agent in a separate session, on a shared working tree. Blocking semaphore: 'wait' and 'send-wait' block the caller until the other agent writes a new message (or until the timeout). Leaves a readable local log at <root>/.agents/<channel>/ (root = the `root` param, AGENT_CHANNEL_ROOT env, or the session cwd). Use it when the user puts you in communication with another agent via a file channel. If the two agents run in DIFFERENT directories, pass the SAME `root` (e.g. a common parent dir) on both so they share one transcript. Actions: 'send' (write + return immediately), 'wait' (block until other writes), 'send-wait' (write + block), 'show' (print whole transcript). Output is structured TOON on stdout. details.exitCode: 0 = ok, 2 = timeout (a `timeout:` object with a `reminder` is returned, keep waiting) OR usage error (an `error:` object), 1 = internal error.",
     promptSnippet:
-      "Coordinate with another agent via mailbox channel (send/wait/send-wait/show) — blocking semaphore on shared working tree",
+      "Coordinate with another agent via mailbox channel (send/wait/send-wait/show) — blocking semaphore on shared working tree. Output is TOON.",
     promptGuidelines: [
-      "Use the agent_channel tool to exchange messages with another agent when the user sets up a file-channel coordination between two sessions. Prefer 'send-wait' for a turn (write your message and block for the reply). If agent_channel returns exit code 2 (timeout) with the reminder, call it again with action 'wait' (or 'send-wait' to add a note) unless you have reason to believe the other agent is truly absent.",
+      "Use the agent_channel tool to exchange messages with another agent when the user sets up a file-channel coordination between two sessions. Prefer 'send-wait' for a turn (write your message and block for the reply).",
+      "Output is structured TOON: on a successful wait/send-wait you get a `messages[N]{ts,sender,msg}` table; on timeout (exit code 2) you get a `timeout:` object with a `reminder` string — call agent_channel again with action 'wait' (or 'send-wait' to add a note) unless you have reason to believe the other agent is truly absent.",
+      "Details are in details.exitCode (0 ok, 2 timeout/usage, 1 error) and details.status (ok/timeout/usage_error/error).",
     ],
     // JSON schema plain (no typebox dep). Pi accetta entrambi.
     parameters: {
@@ -71,24 +74,38 @@ export default function (pi) {
         },
         timeout: {
           type: "number",
-          description: "Seconds. Default 210 (3.5 min). For wait / send-wait. At timeout: exit 2 + reminder printed.",
+          description: "Seconds. Default 210 (3.5 min). For wait / send-wait. At timeout: exit 2 + reminder returned.",
+        },
+        root: {
+          type: "string",
+          description: "Shared root directory for the channel transcript (<root>/.agents/<channel>/). Use it when the two agents run in DIFFERENT working directories: set the SAME root on both (e.g. a common parent dir like the repo group root) so they read/write the same transcript. Defaults to the session cwd (or AGENT_CHANNEL_ROOT env).",
         },
       },
     },
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      // Guard: il bin deve esistere. Se il package è stato rimosso/spostato (o la
+      // sessione ha caricato un'estensione stale), restituisci un errore
+      // strutturato ACTIONABLE invece di lasciar leakare il traceback di node
+      // ("Cannot find module ..."). AXI §6: traduci l'errore, niente rumore.
+      if (!existsSync(BIN)) {
+        return {
+          content: [{ type: "text", text: `error: agent_channel script not found at ${BIN} — the pi-agent-channel package may be missing or this session loaded a stale extension. Reinstall it (\`pi install\` from its source) and RESTART this pi session so the tool reloads.` }],
+          details: { error: true, status: "error" },
+        };
+      }
       const action = params.action;
       const channel = String(params.channel || "");
       const who = params.who ? String(params.who) : "";
       const msg = params.msg != null ? String(params.msg) : "";
 
       if (!channel) {
-        return { content: [{ type: "text", text: "agent_channel: 'channel' is required." }], details: { error: true } };
+        return { content: [{ type: "text", text: "error: 'channel' is required" }], details: { error: true, status: "usage_error" } };
       }
       if ((action === "send" || action === "send-wait") && !msg) {
-        return { content: [{ type: "text", text: "agent_channel: 'msg' is required for send / send-wait." }], details: { error: true } };
+        return { content: [{ type: "text", text: "error: 'msg' is required for send / send-wait" }], details: { error: true, status: "usage_error" } };
       }
       if (action !== "show" && !who) {
-        return { content: [{ type: "text", text: "agent_channel: 'who' is required for " + action + "." }], details: { error: true } };
+        return { content: [{ type: "text", text: "error: 'who' is required for " + action }], details: { error: true, status: "usage_error" } };
       }
 
       const args = [action, channel];
@@ -97,14 +114,23 @@ export default function (pi) {
       if ((action === "wait" || action === "send-wait") && typeof params.timeout === "number") {
         args.push("--timeout=" + params.timeout);
       }
+      if (params.root) args.push("--root=" + params.root);
 
       const { stdout, stderr, exitCode } = await runScript(args, ctx?.cwd || process.cwd(), signal);
-      const out = [stdout, stderr].map((s) => (s || "").trim()).filter(Boolean).join("\n");
-      const status = exitCode === 0 ? "ok" : exitCode === 2 ? "timeout" : "error";
+      // stdout è TOON strutturato. stderr solo diagnostica (non attesa).
+      const out = (stdout || "").trim();
+      // exit 2 = timeout OPPURE usage error: distingui dal contenuto TOON.
+      //   timeout  → stdout contiene un oggetto `timeout:`
+      //   usage    → stdout contiene un oggetto `error:`
+      let status;
+      if (exitCode === 0) status = "ok";
+      else if (exitCode === 2) status = /(^|\n)timeout:/.test(out) ? "timeout" : "usage_error";
+      else status = "error";
 
       let text = out;
-      if (!text) text = `(agent_channel ${action} → exit ${exitCode}, no output)`;
-      if (exitCode !== 0) text = `[exit ${exitCode} / ${status}]\n${text}`;
+      if (!text) {
+        text = stderr.trim() || `(agent_channel ${action} → exit ${exitCode}, no output)`;
+      }
 
       return {
         content: [{ type: "text", text }],
